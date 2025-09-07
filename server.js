@@ -16,23 +16,21 @@ const MONGO_URI = process.env.MONGO_URI;
 
 // connect to Mongo and define the Lead model if configured
 (async function connectIfConfigured() {
-  if (!MONGO_URI) {
-    console.warn('MONGO_URI not set — API will run without DB');
-    return;
-  }
+  if (!MONGO_URI) { console.warn('MONGO_URI not set — API will run without DB'); return; }
   try {
     await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 });
     const schema = new mongoose.Schema({
-      name: String, email: String, phone: String, message: String,
+      name: String,
+      email: String,
+      phone: String,
+      message: String,
       source: { type: String, default: 'tally' },
       status: { type: String, default: 'new' },
       meta: Object
     }, { timestamps: true });
     Lead = mongoose.models.Lead || mongoose.model('Lead', schema);
     console.log('MongoDB connected');
-  } catch (e) {
-    console.error('MongoDB connection error:', e.message);
-  }
+  } catch (e) { console.error('MongoDB connection error:', e.message); }
 })();
 
 // healthcheck
@@ -47,9 +45,7 @@ app.get('/api/leads', async (_req, res) => {
     if (!Lead) return res.status(200).json({ ok: true, count: 0, leads: [] });
     const leads = await Lead.find({}).sort({ createdAt: -1 }).limit(200);
     res.json({ ok: true, count: leads.length, leads });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 app.post('/api/leads', async (req, res) => {
@@ -66,25 +62,52 @@ app.post('/api/leads', async (req, res) => {
       meta: b.meta || {}
     });
     res.status(201).json({ ok: true, lead });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// ---- Tally webhook ----
+// helper: find a field by label from Tally's fields[]
+function findField(fields, labelOptions) {
+  if (!Array.isArray(fields)) return null;
+  const norm = s => String(s || '').trim().toLowerCase();
+  const wanted = labelOptions.map(norm);
+  const hit = fields.find(f => wanted.includes(norm(f.label)));
+  return hit ? hit.value : null;
+}
+
+// ---- Tally webhook (parses labels) ----
 app.post('/api/webhooks/tally', async (req, res) => {
+  // Optional shared secret (safe to leave unset)
+  const required = process.env.TALLY_SECRET;
+  const provided = req.query.secret || req.get('x-tally-secret');
+  if (required && provided !== required) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized webhook' });
+  }
+
   const p = req.body || {};
-  const name = p.name || p.fullName || `${p.firstName || ''} ${p.lastName || ''}`.trim();
-  const email = p.email || (p.answers && p.answers.email);
-  const phone = p.phone || (p.answers && p.answers.phone);
-  const message = p.message || p.notes || JSON.stringify(p.answers || p, null, 2);
+  const fields = p?.data?.fields;
+
+  // Parse common labels from your Tally form
+  const first = findField(fields, ['First name', 'First Name', 'First']);
+  const last  = findField(fields,  ['Last name', 'Last Name', 'Last']);
+  const email = findField(fields,  ['Email', 'E-mail']);
+  const phone = findField(fields,  ['Phone number', 'Phone', 'Phone Number']);
+  const msg   = findField(fields,  ['Your question', 'Message', 'Notes', 'Comments']);
+
+  const name = `${first || ''} ${last || ''}`.trim() || p.name || p.fullName || '';
 
   if (Lead && mongoose.connection.readyState === 1) {
     try {
-      const lead = await Lead.create({ name, email, phone, message, source: 'tally', status: 'new', meta: p });
+      const lead = await Lead.create({
+        name, email, phone,
+        message: msg || '',
+        source: 'tally',
+        status: 'new',
+        meta: p
+      });
       return res.status(200).json({ ok: true, received: true, saved: true, leadId: lead._id.toString() });
     } catch (e) {
       console.error('DB save error:', e.message);
+      return res.status(500).json({ ok: false, error: 'DB save error' });
     }
   } else {
     console.log('Webhook received (no DB configured):', { name, email, phone });
